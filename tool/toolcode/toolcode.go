@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"trpc.group/trpc-go/trpc-agent-go/agent"
 	bridge "trpc.group/trpc-go/trpc-agent-go/codeexecutor/codeact"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -23,8 +24,9 @@ import (
 // Option configures the execute_tool_code tool.
 type Option func(*config)
 type config struct {
-	name        string
-	description string
+	name                         string
+	description                  string
+	checkParentRunToolPermission bool
 }
 
 // WithName overrides the default execute_tool_code tool name.
@@ -33,6 +35,16 @@ func WithName(name string) Option { return func(c *config) { c.name = name } }
 // WithDescription replaces the default execute_tool_code tool description.
 func WithDescription(description string) Option {
 	return func(c *config) { c.description = description }
+}
+
+// WithParentRunToolPermissionPolicy makes guest tool calls honor the parent
+// run's ToolPermissionPolicy. The check runs after the tool allowlist and
+// argument schema, immediately before the host tool executes. A deny or ask
+// decision returns a structured permission result to the guest instead of
+// executing the tool. Without this option, guest calls keep the existing
+// behavior and are authorized only by the managed-tool allowlist.
+func WithParentRunToolPermissionPolicy() Option {
+	return func(c *config) { c.checkParentRunToolPermission = true }
 }
 
 // NewTool creates an execute_tool_code tool. Only tools supplied here can be called
@@ -50,6 +62,9 @@ func NewTool(runtime bridge.Runtime, managedTools []tool.CallableTool, opts ...O
 	gateway, err := bridge.NewGateway(managedTools...)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.checkParentRunToolPermission {
+		gateway.SetPermissionPolicy(parentRunToolPermissionPolicy{})
 	}
 	return &executeCodeTool{
 		runtime:  runtime,
@@ -117,4 +132,20 @@ func buildToolHelp(tools []tool.CallableTool) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// parentRunToolPermissionPolicy reads the ToolPermissionPolicy of the run that
+// owns ctx. A guest call outside an invocation, or a run without a policy,
+// keeps the historical allow behavior.
+type parentRunToolPermissionPolicy struct{}
+
+func (parentRunToolPermissionPolicy) CheckToolPermission(
+	ctx context.Context,
+	req *tool.PermissionRequest,
+) (tool.PermissionDecision, error) {
+	invocation, ok := agent.InvocationFromContext(ctx)
+	if !ok || invocation == nil || invocation.RunOptions.ToolPermissionPolicy == nil {
+		return tool.AllowPermission(), nil
+	}
+	return invocation.RunOptions.ToolPermissionPolicy.CheckToolPermission(ctx, req)
 }

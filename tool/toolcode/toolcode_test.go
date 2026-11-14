@@ -11,11 +11,13 @@ package toolcode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"trpc.group/trpc-go/trpc-agent-go/agent"
 	bridge "trpc.group/trpc-go/trpc-agent-go/codeexecutor/codeact"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -120,4 +122,118 @@ type declaredTool struct{ decl *tool.Declaration }
 func (t declaredTool) Declaration() *tool.Declaration { return t.decl }
 func (declaredTool) Call(context.Context, []byte) (any, error) {
 	return nil, nil
+}
+
+type countingDocumentTool struct {
+	calls int
+}
+
+func (t *countingDocumentTool) Declaration() *tool.Declaration {
+	return &tool.Declaration{
+		Name: "read_document",
+		InputSchema: &tool.Schema{
+			Type:       "object",
+			Required:   []string{"id"},
+			Properties: map[string]*tool.Schema{"id": {Type: "string"}},
+		},
+	}
+}
+
+func (t *countingDocumentTool) Call(context.Context, []byte) (any, error) {
+	t.calls++
+	return map[string]string{"content": "secret"}, nil
+}
+
+type toolCallingRuntime struct {
+	call bridge.ToolCall
+}
+
+func (r *toolCallingRuntime) ExecuteCodeAct(ctx context.Context, _ bridge.Request, handler bridge.ToolCallHandler) (bridge.Result, error) {
+	raw, err := handler.HandleToolCall(ctx, r.call)
+	if err != nil {
+		return bridge.Result{}, err
+	}
+	return bridge.Result{Value: raw}, nil
+}
+
+func TestToolParentRunToolPermissionPolicyOptIn(t *testing.T) {
+	readDocument := &countingDocumentTool{}
+	runtime := &toolCallingRuntime{call: bridge.ToolCall{
+		ID:   "inner-1",
+		Name: "read_document",
+		Args: json.RawMessage(`{"id":"doc-1"}`),
+	}}
+	var got *tool.PermissionRequest
+	policy := tool.PermissionPolicyFunc(func(_ context.Context, req *tool.PermissionRequest) (tool.PermissionDecision, error) {
+		got = req
+		return tool.DenyPermission("document is off limits"), nil
+	})
+	invocation := &agent.Invocation{RunOptions: agent.NewRunOptions(agent.WithToolPermissionPolicy(policy))}
+	ctx := agent.NewInvocationContext(context.Background(), invocation)
+
+	checked, err := NewTool(runtime, []tool.CallableTool{readDocument}, WithParentRunToolPermissionPolicy())
+	require.NoError(t, err)
+	result, err := checked.Call(ctx, []byte(`{"code":"return await call_tool('read_document', id='doc-1')"}`))
+	require.NoError(t, err)
+	denied := result.(bridge.Result)
+	require.JSONEq(t, `{"status":"denied","tool":"read_document","reason":"document is off limits"}`, string(denied.Value))
+	require.Zero(t, readDocument.calls)
+	require.NotNil(t, got)
+	require.Equal(t, "inner-1", got.ToolCallID)
+	require.Equal(t, "read_document", got.ToolName)
+	require.JSONEq(t, `{"id":"doc-1"}`, string(got.Arguments))
+	require.NotNil(t, got.Declaration)
+
+	unchecked, err := NewTool(runtime, []tool.CallableTool{readDocument})
+	require.NoError(t, err)
+	result, err = unchecked.Call(ctx, []byte(`{"code":"return await call_tool('read_document', id='doc-1')"}`))
+	require.NoError(t, err)
+	allowed := result.(bridge.Result)
+	require.JSONEq(t, `{"content":"secret"}`, string(allowed.Value))
+	require.Equal(t, 1, readDocument.calls)
+}
+
+func TestToolParentRunToolPermissionPolicyDefaultsToAllow(t *testing.T) {
+	readDocument := &countingDocumentTool{}
+	runtime := &toolCallingRuntime{call: bridge.ToolCall{
+		ID:   "inner-1",
+		Name: "read_document",
+		Args: json.RawMessage(`{"id":"doc-1"}`),
+	}}
+	toolValue, err := NewTool(runtime, []tool.CallableTool{readDocument}, WithParentRunToolPermissionPolicy())
+	require.NoError(t, err)
+
+	result, err := toolValue.Call(context.Background(), []byte(`{"code":"return await call_tool('read_document', id='doc-1')"}`))
+	require.NoError(t, err)
+	got := result.(bridge.Result)
+	require.JSONEq(t, `{"content":"secret"}`, string(got.Value))
+	require.Equal(t, 1, readDocument.calls)
+
+	ctx := agent.NewInvocationContext(context.Background(), &agent.Invocation{})
+	result, err = toolValue.Call(ctx, []byte(`{"code":"return await call_tool('read_document', id='doc-1')"}`))
+	require.NoError(t, err)
+	got = result.(bridge.Result)
+	require.JSONEq(t, `{"content":"secret"}`, string(got.Value))
+	require.Equal(t, 2, readDocument.calls)
+}
+
+func TestToolParentRunToolPermissionPolicyError(t *testing.T) {
+	readDocument := &countingDocumentTool{}
+	runtime := &toolCallingRuntime{call: bridge.ToolCall{
+		ID:   "inner-1",
+		Name: "read_document",
+		Args: json.RawMessage(`{"id":"doc-1"}`),
+	}}
+	policy := tool.PermissionPolicyFunc(func(context.Context, *tool.PermissionRequest) (tool.PermissionDecision, error) {
+		return tool.PermissionDecision{}, errors.New("policy unavailable")
+	})
+	ctx := agent.NewInvocationContext(context.Background(), &agent.Invocation{
+		RunOptions: agent.NewRunOptions(agent.WithToolPermissionPolicy(policy)),
+	})
+	toolValue, err := NewTool(runtime, []tool.CallableTool{readDocument}, WithParentRunToolPermissionPolicy())
+	require.NoError(t, err)
+
+	_, err = toolValue.Call(ctx, []byte(`{"code":"return await call_tool('read_document', id='doc-1')"}`))
+	require.ErrorContains(t, err, "policy unavailable")
+	require.Zero(t, readDocument.calls)
 }

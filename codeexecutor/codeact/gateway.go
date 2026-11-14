@@ -26,7 +26,8 @@ import (
 // It deliberately accepts and returns JSON so a guest language never receives
 // Go object references or host credentials.
 type Gateway struct {
-	tools map[string]registeredTool
+	tools            map[string]registeredTool
+	permissionPolicy tool.PermissionPolicy
 }
 
 type registeredTool struct {
@@ -94,9 +95,28 @@ func (g *Gateway) Names() []string {
 	return names
 }
 
+// SetPermissionPolicy installs an optional policy checked for every guest tool
+// call after the argument schema and immediately before the tool executes. A
+// nil policy disables the check. Set it before the gateway starts serving.
+func (g *Gateway) SetPermissionPolicy(policy tool.PermissionPolicy) {
+	if g == nil {
+		return
+	}
+	g.permissionPolicy = policy
+}
+
 // Call validates a JSON argument object, invokes one allowlisted tool, then
 // validates and serializes its result before returning it to the guest.
 func (g *Gateway) Call(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error) {
+	return g.call(ctx, "", name, args)
+}
+
+// HandleToolCall implements ToolCallHandler.
+func (g *Gateway) HandleToolCall(ctx context.Context, call ToolCall) (json.RawMessage, error) {
+	return g.call(ctx, call.ID, call.Name, call.Args)
+}
+
+func (g *Gateway) call(ctx context.Context, callID, name string, args json.RawMessage) (json.RawMessage, error) {
 	if g == nil {
 		return nil, fmt.Errorf("codeact: nil gateway")
 	}
@@ -106,6 +126,30 @@ func (g *Gateway) Call(ctx context.Context, name string, args json.RawMessage) (
 	}
 	if err := validateJSON(args, registered.inputSchema, "input"); err != nil {
 		return nil, err
+	}
+	if g.permissionPolicy != nil {
+		decision, err := g.permissionPolicy.CheckToolPermission(ctx, &tool.PermissionRequest{
+			Tool:        registered.tool,
+			ToolName:    name,
+			ToolCallID:  callID,
+			Declaration: registered.tool.Declaration(),
+			Arguments:   append([]byte(nil), args...),
+			Metadata:    tool.MetadataOf(registered.tool),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("codeact: check permission for %q: %w", name, err)
+		}
+		decision, err = tool.NormalizePermissionDecision(decision)
+		if err != nil {
+			return nil, fmt.Errorf("codeact: normalize permission decision for %q: %w", name, err)
+		}
+		if decision.Action != tool.PermissionActionAllow {
+			raw, err := json.Marshal(tool.PermissionResultFor(name, decision))
+			if err != nil {
+				return nil, fmt.Errorf("codeact: encode permission result for %q: %w", name, err)
+			}
+			return raw, nil
+		}
 	}
 	value, err := registered.tool.Call(ctx, args)
 	if err != nil {
@@ -121,11 +165,6 @@ func (g *Gateway) Call(ctx context.Context, name string, args json.RawMessage) (
 		}
 	}
 	return raw, nil
-}
-
-// HandleToolCall implements ToolCallHandler.
-func (g *Gateway) HandleToolCall(ctx context.Context, call ToolCall) (json.RawMessage, error) {
-	return g.Call(ctx, call.Name, call.Args)
 }
 
 func compileSchema(schema *tool.Schema, toolName, direction string) (*jsonschema.Schema, error) {

@@ -194,3 +194,106 @@ func TestGatewayNamesAndCallFailures(t *testing.T) {
 	_, err = g.Call(context.Background(), "alpha", json.RawMessage(`{}`))
 	require.ErrorContains(t, err, "encode result")
 }
+
+type metadataTestTool struct {
+	testTool
+	metadata tool.ToolMetadata
+}
+
+func (t metadataTestTool) ToolMetadata() tool.ToolMetadata { return t.metadata }
+
+func TestGatewayPermissionPolicyRunsAfterValidation(t *testing.T) {
+	var calls int
+	var got *tool.PermissionRequest
+	read := metadataTestTool{
+		testTool: testTool{
+			declaration: &tool.Declaration{
+				Name: "read_document",
+				InputSchema: &tool.Schema{
+					Type:       "object",
+					Required:   []string{"id"},
+					Properties: map[string]*tool.Schema{"id": {Type: "string"}},
+				},
+			},
+			call: func([]byte) (any, error) {
+				calls++
+				return map[string]string{"content": "secret"}, nil
+			},
+		},
+		metadata: tool.ToolMetadata{ReadOnly: true},
+	}
+	g, err := NewGateway(read)
+	require.NoError(t, err)
+	g.SetPermissionPolicy(tool.PermissionPolicyFunc(func(_ context.Context, req *tool.PermissionRequest) (tool.PermissionDecision, error) {
+		got = req
+		return tool.DenyPermission("document is off limits"), nil
+	}))
+
+	_, err = g.HandleToolCall(context.Background(), ToolCall{ID: "inner-1", Name: "read_document", Args: json.RawMessage(`{}`)})
+	require.Error(t, err)
+	require.Nil(t, got)
+	require.Zero(t, calls)
+
+	raw, err := g.HandleToolCall(context.Background(), ToolCall{ID: "inner-2", Name: "read_document", Args: json.RawMessage(`{"id":"doc-1"}`)})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"status":"denied","tool":"read_document","reason":"document is off limits"}`, string(raw))
+	require.NotNil(t, got)
+	require.Equal(t, "inner-2", got.ToolCallID)
+	require.Equal(t, "read_document", got.ToolName)
+	require.JSONEq(t, `{"id":"doc-1"}`, string(got.Arguments))
+	require.True(t, got.Metadata.ReadOnly)
+	require.NotNil(t, got.Declaration)
+	require.Zero(t, calls)
+}
+
+func TestGatewayPermissionDecisions(t *testing.T) {
+	tests := []struct {
+		name       string
+		decision   tool.PermissionDecision
+		policyErr  error
+		wantStatus string
+		wantErr    string
+		wantCalled bool
+	}{
+		{name: "allow", decision: tool.AllowPermission(), wantCalled: true},
+		{name: "deny", decision: tool.DenyPermission("denied by policy"), wantStatus: tool.PermissionResultStatusDenied},
+		{name: "ask", decision: tool.AskPermission("approval required"), wantStatus: tool.PermissionResultStatusApprovalRequired},
+		{name: "policy error", policyErr: errors.New("policy failed"), wantErr: "policy failed"},
+		{name: "unknown action", decision: tool.PermissionDecision{Action: "unknown"}, wantErr: "unknown permission action"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			g, err := NewGateway(testTool{
+				declaration: &tool.Declaration{Name: "read_document", InputSchema: &tool.Schema{Type: "object"}},
+				call: func([]byte) (any, error) {
+					called = true
+					return map[string]string{"content": "ok"}, nil
+				},
+			})
+			require.NoError(t, err)
+			g.SetPermissionPolicy(tool.PermissionPolicyFunc(func(context.Context, *tool.PermissionRequest) (tool.PermissionDecision, error) {
+				return tt.decision, tt.policyErr
+			}))
+
+			raw, err := g.HandleToolCall(context.Background(), ToolCall{ID: "inner-1", Name: "read_document", Args: json.RawMessage(`{}`)})
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				require.False(t, called)
+				return
+			}
+			require.NoError(t, err)
+			if tt.wantStatus != "" {
+				var result tool.PermissionResult
+				require.NoError(t, json.Unmarshal(raw, &result))
+				require.Equal(t, tt.wantStatus, result.Status)
+				require.Equal(t, "read_document", result.Tool)
+				require.Equal(t, tt.decision.Reason, result.Reason)
+				require.False(t, called)
+				return
+			}
+			require.JSONEq(t, `{"content":"ok"}`, string(raw))
+			require.True(t, called)
+		})
+	}
+}

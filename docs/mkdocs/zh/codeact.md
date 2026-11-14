@@ -87,7 +87,7 @@ cd examples && go run ./codeact -model gpt-5
 
 需要给 Agent 暴露工具时，调用 `tool/toolcode.NewTool(runtime, managedTools)`，将返回的 `execute_tool_code` 注册给 Agent。只有 `managedTools` 能被 guest 中的 `await call_tool(...)` 调用。
 
-第一版中，managed tool 是同步的直接宿主能力调用：内置 Python guest 任一时刻只有一个调用在执行，`await` 是 guest API 的调用形式，但 `asyncio.gather(...)` 不会产生并行的宿主工具调用。宿主工具失败会在 Python 中表现为 `RuntimeError`，生成代码可用 `try`/`except` 处理。它不会重放 Agent 的 callback、retry 或内层 tracing 生命周期，也不能在执行中暂停以等待交互式审批。不要把需要“审批后恢复”流程的工具加入 `managedTools`；授权应在业务工具自身或应用定义的 adapter tool 中实现。
+第一版中，managed tool 是同步的直接宿主能力调用：内置 Python guest 任一时刻只有一个调用在执行，`await` 是 guest API 的调用形式，但 `asyncio.gather(...)` 不会产生并行的宿主工具调用。宿主工具失败会在 Python 中表现为 `RuntimeError`，生成代码可用 `try`/`except` 处理。它不会重放 Agent 的 callback、retry 或内层 tracing 生命周期，也不能在执行中暂停以等待交互式审批。不要把需要“审批后恢复”流程的工具加入 `managedTools`；授权应在业务工具自身或应用定义的 adapter tool 中实现。若要把父 run 的 `ToolPermissionPolicy` 应用到 guest 调用，可启用 `toolcode.WithParentRunToolPermissionPolicy()`；检查会在 allowlist 和输入 schema 之后执行，deny 或 ask 决策会返回结构化 permission result，并跳过工具执行。
 
 ## 面向模型的工具说明
 
